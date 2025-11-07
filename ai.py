@@ -15,7 +15,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame, 
     TextFrame, 
     EndFrame,
-    TTSAudioRawFrame,
+    LLMMessagesFrame,
     TTSStartedFrame,
     TTSStoppedFrame
 )
@@ -36,8 +36,44 @@ logger.remove(0)
 logger.add(sys.stderr, level="DEBUG")
 
 
+# Store active websocket connections
+active_connections = {}
+
+
 # FastAPI application for handling Twilio webhooks
 app = FastAPI()
+
+
+class TwilioAudioSender(FrameProcessor):
+    """Send audio frames back to Twilio WebSocket"""
+    
+    def __init__(self, websocket: WebSocket, stream_sid: str):
+        super().__init__()
+        self.websocket = websocket
+        self.stream_sid = stream_sid
+        logger.info(f"TwilioAudioSender initialized with stream_sid: {stream_sid}")
+    
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        
+        # Send audio frames to Twilio
+        if isinstance(frame, AudioRawFrame):
+            try:
+                # Encode audio to base64 for Twilio
+                audio_payload = base64.b64encode(frame.audio).decode('utf-8')
+                message = {
+                    "event": "media",
+                    "streamSid": self.stream_sid,
+                    "media": {
+                        "payload": audio_payload
+                    }
+                }
+                await self.websocket.send_json(message)
+                logger.debug(f"Sent {len(frame.audio)} bytes of audio to Twilio")
+            except Exception as e:
+                logger.error(f"Error sending audio to Twilio: {e}")
+        
+        await self.push_frame(frame, direction)
 
 
 @app.post("/make-call")
@@ -89,69 +125,28 @@ async def outbound_voice_webhook(request: Request):
     Handle the outbound call when recipient picks up
     This webhook is called when the Indian number answers
     """
-    try:
-        logger.info("=" * 50)
-        logger.info("📞 WEBHOOK CALLED: /outbound-voice")
-        logger.info("=" * 50)
-        
-        # Log request details
-        logger.info(f"Request URL: {request.url}")
-        logger.info(f"Request method: {request.method}")
-        logger.info(f"Request headers: {dict(request.headers)}")
-        
-        form_data = await request.form()
-        logger.info(f"Form data: {dict(form_data)}")
-        
-        call_status = form_data.get('CallStatus')
-        call_sid = form_data.get('CallSid')
-        from_number = form_data.get('From')
-        to_number = form_data.get('To')
-        
-        logger.info(f"✅ Call Status: {call_status}")
-        logger.info(f"✅ Call SID: {call_sid}")
-        logger.info(f"✅ From: {from_number}")
-        logger.info(f"✅ To: {to_number}")
-        
-        # Get WebSocket URL
-        base_url = os.getenv("BASE_URL")
-        if not base_url:
-            logger.error("❌ BASE_URL not set in environment!")
-            base_url = str(request.base_url).rstrip('/')
-            logger.info(f"Using request base URL: {base_url}")
-        
-        logger.info(f"Base URL: {base_url}")
-        
-        # Create WebSocket URL
-        ws_url = base_url.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
-        logger.info(f"WebSocket URL: {ws_url}")
-        
-        # Return TwiML to connect to AI assistant when call is answered
-        twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="alice">Connecting you to our AI assistant. Please wait.</Say>
-    <Connect>
-        <Stream url="{ws_url}" />
-    </Connect>
-</Response>'''
-        
-        logger.info("✅ Returning TwiML:")
-        logger.info(twiml)
-        logger.info("=" * 50)
-        
-        return Response(content=twiml, media_type="application/xml")
-        
-    except Exception as e:
-        logger.error(f"❌ ERROR in outbound_voice_webhook: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Return error TwiML
-        error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="alice">Sorry, there was an error connecting to the AI assistant.</Say>
-    <Hangup/>
-</Response>'''
-        return Response(content=error_twiml, media_type="application/xml")
+    # Get form data from Twilio
+    form_data = await request.form()
+    call_status = form_data.get('CallStatus')
+    call_sid = form_data.get('CallSid')
+    
+    logger.info(f"Outbound call webhook - CallSID: {call_sid}, Status: {call_status}")
+    
+    # Get WebSocket URL
+    base_url = os.getenv("BASE_URL", "https://your-ngrok-url.ngrok.io")
+    ws_url = base_url.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
+    
+    logger.info(f"Connecting to WebSocket: {ws_url}")
+    
+    # Return TwiML to connect to AI assistant when call is answered
+    twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Connect>
+            <Stream url="{ws_url}" />
+        </Connect>
+    </Response>'''
+    
+    return Response(content=twiml, media_type="application/xml")
 
 
 @app.post("/call-status")
@@ -161,58 +156,44 @@ async def call_status_webhook(request: Request):
     call_sid = form_data.get('CallSid')
     call_status = form_data.get('CallStatus')
     
-    logger.info(f"📞 Call {call_sid} status: {call_status}")
+    logger.info(f"Call {call_sid} status: {call_status}")
     
     return {"status": "received"}
-
-
-class TranscriptionLogger(FrameProcessor):
-    """Custom processor to log transcriptions"""
-    
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        
-        if isinstance(frame, TranscriptionFrame):
-            logger.info(f"🎤 USER SAID: '{frame.text}'")
-            print(f"\n🎤 USER TRANSCRIPTION: {frame.text}\n")
-        elif isinstance(frame, TextFrame):
-            logger.info(f"🤖 AI RESPONSE: '{frame.text}'")
-            print(f"\n🤖 AI TEXT RESPONSE: {frame.text}\n")
-        
-        await self.push_frame(frame, direction)
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """Handle WebSocket connection from Twilio"""
     await websocket.accept()
-    logger.info("✅ WebSocket connection established")
+    logger.info("WebSocket connection established")
     
     stream_sid = None
+    task = None
+    pipeline_task = None
     
     try:
-        logger.info("⏳ Initializing Azure STT...")
+        # Initialize Azure STT
         stt = AzureSTTService(
             api_key=os.getenv("AZURE_SPEECH_API_KEY"),
             region=os.getenv("AZURE_SPEECH_REGION"),
             language="en-US",
         )
-        logger.info("✅ Azure STT initialized")
+        logger.info("STT initialized")
         
-        logger.info("⏳ Initializing OpenAI LLM...")
+        # Initialize OpenAI LLM
         llm = OpenAILLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
             model="gpt-4o-mini",
         )
-        logger.info("✅ OpenAI LLM initialized")
+        logger.info("LLM initialized")
         
-        logger.info("⏳ Initializing Azure TTS...")
+        # Initialize Azure TTS
         tts = AzureTTSService(
             api_key=os.getenv("AZURE_SPEECH_API_KEY"),
             region=os.getenv("AZURE_SPEECH_REGION"),
             voice="en-US-JennyNeural",
         )
-        logger.info("✅ Azure TTS initialized")
+        logger.info("TTS initialized")
         
         # Set up conversation context
         messages = [
@@ -222,138 +203,127 @@ async def websocket_endpoint(websocket: WebSocket):
             },
         ]
         
-        # Create aggregators
+        # Create aggregators to handle conversation flow
         user_response = LLMUserResponseAggregator(messages)
         assistant_response = LLMAssistantResponseAggregator(messages)
-        transcription_logger = TranscriptionLogger()
         
-        # Create pipeline with logger
-        pipeline = Pipeline([
-            stt,
-            transcription_logger,  # Log transcriptions
-            user_response,
-            llm,
-            tts,
-            assistant_response,
-        ])
+        # Pipeline will be created after we get stream_sid from Twilio
+        pipeline = None
         
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                allow_interruptions=True,
-                enable_metrics=True,
-            ),
-        )
-        
-        logger.info("✅ Pipeline created")
-        
-        # Queue to collect output frames
-        output_queue = asyncio.Queue()
-        
-        # Task to handle output frames
-        async def handle_output():
-            try:
-                while True:
-                    frame = await output_queue.get()
-                    
-                    if isinstance(frame, EndFrame):
-                        logger.info("🛑 End frame received")
-                        break
-                    
-                    # Send TTS audio back to Twilio
-                    if isinstance(frame, TTSAudioRawFrame) or isinstance(frame, AudioRawFrame):
-                        if stream_sid and hasattr(frame, 'audio'):
-                            try:
-                                audio_payload = base64.b64encode(frame.audio).decode('utf-8')
-                                message = {
-                                    "event": "media",
-                                    "streamSid": stream_sid,
-                                    "media": {
-                                        "payload": audio_payload
-                                    }
-                                }
-                                await websocket.send_json(message)
-                                logger.debug("🔊 Sent audio chunk to Twilio")
-                            except Exception as e:
-                                logger.error(f"❌ Error sending audio: {e}")
-            except Exception as e:
-                logger.error(f"❌ Error in output handler: {e}")
-        
-        # Start output handler
-        output_task = asyncio.create_task(handle_output())
-        
-        # Run the pipeline in background
-        runner = PipelineRunner()
-        pipeline_task = asyncio.create_task(runner.run(task))
-        
-        logger.info("✅ Pipeline started")
-        
-        # Flag for greeting
+        # Flag to track if we've sent the greeting
         greeting_sent = False
         
         # Handle incoming audio stream from Twilio
-        try:
-            while True:
-                data = await websocket.receive_json()
+        async for message in websocket.iter_json():
+            try:
+                event = message.get('event')
+                logger.debug(f"Received event: {event}")
                 
-                if data['event'] == 'start':
-                    stream_sid = data['start']['streamSid']
-                    call_sid = data['start'].get('callSid', 'unknown')
-                    logger.info(f"✅ Stream started - StreamSID: {stream_sid}, CallSID: {call_sid}")
+                if event == 'start':
+                    stream_sid = message['start']['streamSid']
+                    call_sid = message['start'].get('callSid', 'unknown')
+                    logger.info(f"Stream started - StreamSID: {stream_sid}, CallSID: {call_sid}")
                     
-                    # Wait for connection to stabilize
+                    # Create Twilio audio sender now that we have stream_sid
+                    twilio_sender = TwilioAudioSender(websocket, stream_sid)
+                    
+                    # Create pipeline with Twilio sender
+                    pipeline = Pipeline([
+                        stt,
+                        user_response,
+                        llm,
+                        tts,
+                        twilio_sender,  # Add this to send audio back
+                        assistant_response,
+                    ])
+                    
+                    task = PipelineTask(
+                        pipeline,
+                        params=PipelineParams(
+                            allow_interruptions=True,
+                            enable_metrics=True,
+                            enable_usage_metrics=True,
+                        ),
+                    )
+                    
+                    # Start the pipeline runner
+                    runner = PipelineRunner()
+                    pipeline_task = asyncio.create_task(runner.run(task))
+                    logger.info("Pipeline started")
+                    
+                    # Wait a moment for connection to stabilize
                     await asyncio.sleep(1.0)
                     
-                    # Send greeting via TTS
+                    # Send initial greeting by queuing a text frame
                     if not greeting_sent:
                         greeting = "Hello! I'm your AI assistant. How can I help you today?"
-                        logger.info(f"📢 Sending greeting: {greeting}")
+                        logger.info(f"Sending greeting: {greeting}")
                         
-                        greeting_frame = TextFrame(text=greeting)
-                        await task.queue_frame(greeting_frame)
+                        # Queue greeting as a text frame that will go through TTS
+                        await task.queue_frames([
+                            TextFrame(greeting)
+                        ])
                         greeting_sent = True
-                
-                elif data['event'] == 'media':
-                    # Receive audio from user
-                    audio_payload = data['media']['payload']
+                    
+                elif event == 'media':
+                    # Process incoming audio from user
+                    if task is None:
+                        logger.warning("Received media before stream started")
+                        continue
+                        
+                    audio_payload = message['media']['payload']
                     audio_bytes = base64.b64decode(audio_payload)
                     
-                    # Send to STT pipeline
+                    # Twilio sends μ-law encoded audio at 8kHz
                     audio_frame = AudioRawFrame(
                         audio=audio_bytes,
                         sample_rate=8000,
                         num_channels=1
                     )
                     await task.queue_frame(audio_frame)
-                
-                elif data['event'] == 'stop':
-                    logger.info("🛑 Stream stopped by Twilio")
-                    await task.queue_frame(EndFrame())
-                    await output_queue.put(EndFrame())
+                    
+                elif event == 'stop':
+                    logger.info("Stream stopped by Twilio")
+                    if task:
+                        await task.queue_frame(EndFrame())
                     break
+                    
+            except Exception as e:
+                logger.error(f"Error processing message: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
         
-        except Exception as e:
-            logger.error(f"❌ Error in WebSocket receive loop: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # Cleanup
-        logger.info("⏳ Waiting for tasks to complete...")
-        await asyncio.gather(pipeline_task, output_task, return_exceptions=True)
-        logger.info("✅ Tasks completed")
-        
+        # Cancel pipeline task if it's running
+        if pipeline_task and not pipeline_task.done():
+            logger.info("Cancelling pipeline task")
+            pipeline_task.cancel()
+            try:
+                await pipeline_task
+            except asyncio.CancelledError:
+                logger.info("Pipeline task cancelled")
+                pass
+                
     except Exception as e:
-        logger.error(f"❌ Error in WebSocket handler: {e}")
+        logger.error(f"Error in WebSocket handler: {e}")
         import traceback
         traceback.print_exc()
     finally:
+        if task:
+            try:
+                await task.queue_frame(EndFrame())
+            except Exception as e:
+                logger.debug(f"Error sending EndFrame: {e}")
+        
         try:
             await websocket.close()
-        except:
-            pass
-        logger.info("❌ WebSocket connection closed")
+        except Exception as e:
+            logger.debug(f"Error closing websocket: {e}")
+            
+        logger.info("WebSocket connection closed")
 
 
+# API endpoint to trigger a call programmatically
 @app.get("/")
 async def root():
     """Simple status page"""
@@ -369,25 +339,10 @@ async def root():
     }
 
 
-@app.get("/test")
-async def test_endpoint():
-    """Test endpoint to verify server is reachable"""
-    base_url = os.getenv("BASE_URL", "not_set")
-    return {
-        "status": "✅ Server is working!",
-        "base_url": base_url,
-        "ws_url": base_url.replace("https://", "wss://").replace("http://", "ws://") + "/ws" if base_url != "not_set" else "not_set"
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """Simple health check"""
-    return {"status": "ok", "service": "ai-voice-assistant"}
-
-
 if __name__ == "__main__":
+    # Run the FastAPI server
     port = int(os.getenv("PORT", 8000))
+    logger.info(f"Starting server on port {port}")
     uvicorn.run(
         app,
         host="0.0.0.0",
